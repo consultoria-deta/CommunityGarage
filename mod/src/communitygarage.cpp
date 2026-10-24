@@ -965,6 +965,54 @@ static bool updates_enabled(const wchar_t* dir) {
     return GetPrivateProfileIntW(L"updates", L"check", 1, ini.c_str()) != 0;
 }
 
+// ---- The MODS page (Pause > Settings > MODS): the switches live in server.ini, so a change is written back there.
+static std::wstring g_ini_path;
+static void on_setting_changed(void*, const char* key, int value) {
+    const wchar_t* section = nullptr;
+    const wchar_t* name = nullptr;
+    if (!std::strcmp(key, "CheckUpdates")) { section = L"updates"; name = L"check"; }
+    else if (!std::strcmp(key, "DebugLog")) { section = L"debug"; name = L"trace"; }
+    else return;
+    WritePrivateProfileStringW(section, name, value ? L"1" : L"0", g_ini_path.c_str());
+    logf("setting %s is now %s (applies the next time the game starts)", key, value ? "on" : "off");
+}
+
+static void add_mods_page_rows(const FH2ModApi* api) {
+    if (api->api_version >= 4) {
+        FH2Setting s{};
+        s.size          = sizeof s;
+        s.key           = "CheckUpdates";
+        s.label         = "Check for updates";
+        s.description   = "Let the mod platform look on GitHub, about every six hours, for a newer Community Garage and tell you on the "
+                          "title screen. Nothing is downloaded or installed for you. Nothing else is sent to GitHub.";
+        s.value         = GetPrivateProfileIntW(L"updates", L"check", 1, g_ini_path.c_str()) != 0;
+        s.needs_restart = 1;
+        s.on_change     = on_setting_changed;
+        api->add_setting(g_mod, &s);
+
+        FH2Setting d{};
+        d.size          = sizeof d;
+        d.key           = "DebugLog";
+        d.label         = "Detailed log (troubleshooting)";
+        d.description   = "Writes much more about what the mod does to fh2-mods\\platform.log. Turn it on only if asked to when "
+                          "reporting a problem; it adds extra hooks to the game and makes the log large.";
+        d.value         = GetPrivateProfileIntW(L"debug", L"trace", 0, g_ini_path.c_str()) != 0;
+        d.needs_restart = 1;
+        d.on_change     = on_setting_changed;
+        api->add_setting(g_mod, &d);
+    }
+    if (api->api_version >= 6) {
+        FH2Setting l{};
+        l.size        = sizeof l;
+        l.key         = "Website";
+        l.label       = "Community Garage on GitHub";
+        l.description = "Releases, what's new, and the player guide.";
+        l.kind        = FH2_SETTING_LINK;
+        l.url         = "https://github.com/qiangqiang101/CommunityGarage";
+        api->add_setting(g_mod, &l);
+    }
+}
+
 FH2MOD_EXPORT int fh2mod_init(const FH2ModApi* api) {
     g_api = api;
     FH2ModInfo info{};
@@ -973,13 +1021,18 @@ FH2MOD_EXPORT int fh2mod_init(const FH2ModApi* api) {
     info.version          = COMMUNITYGARAGE_VERSION;
     info.github_repo      = "qiangqiang101/CommunityGarage";
     info.platform_version = FH2MOD_PLATFORM_VERSION;
-    info.check_updates    = updates_enabled(api->azimuth_dir) ? 1 : 0;   // [updates] check= in server.ini, on by default
+    info.check_updates    = updates_enabled(api->azimuth_dir) ? 1 : 0;
+    info.description      = "Share and download Forza Horizon 2 liveries, tunes and group vinyls from the game's own menus, through the "
+                            "Community Garage server. Needs an internet connection. Your account key, name and what you share go to the "
+                            "community server only.";   // [updates] check= in server.ini, on by default
     g_mod = api->register_mod(&info);
     if (!g_mod) return 1;
     if (api->api_version < 7) {
         api->log(g_mod, "needs platform API 7 (byte patches); reinstall with a newer d3dcompiler_47.dll");
         return 1;
     }
+    g_ini_path = std::wstring(api->azimuth_dir) + L"/communitygarage/server.ini";
+    add_mods_page_rows(api);
     if (!load_config(api->azimuth_dir)) return 0;
     if (HANDLE t = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr)) CloseHandle(t);
     return 0;
