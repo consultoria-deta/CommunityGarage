@@ -15,7 +15,6 @@ Status: working. The game's Share, Find, Suggested and download screens talk to 
   host=your.domain.example
   port=443
   ```
-- The community server (Node.js) lives in its own repository, CommunityTunes&LiveriesServer.
 - `platform/` — the FH2 Mod Platform submodule.
 
 Build (llvm-mingw + CMake + Ninja): `cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=x86_64-w64-mingw32-clang -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-clang++ -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres && cmake --build build`
