@@ -1,0 +1,93 @@
+name: Build
+
+# Builds CommunityGarage.dll (and the FH2 Mod Platform it ships with) and packages the player zip.
+#
+#  - Run it by hand (Actions tab > Build > Run workflow): the zip is uploaded as an artifact of that run.
+#  - Publish a release (tag like v1.0.1): the zip is built and attached to that release as
+#    CommunityGarage-<tag>.zip. The tag has to match VERSION in CMakeLists.txt; bump it first.
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      LLVM_MINGW_VERSION: "20260922"
+    outputs:
+      name: ${{ steps.name.outputs.name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install llvm-mingw + ninja + zip
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build zip
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz" -o llvm-mingw.tar.xz
+          sudo mkdir -p /opt/llvm-mingw
+          sudo tar -xJf llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
+
+      - name: Name the build
+        id: name
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # The version in CMakeLists.txt is what the mod reports and what players' update check compares against
+          # the release tag, so they must agree.
+          version=$(sed -n 's/^project([^ ]* VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          echo "CMakeLists.txt version: $version"
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            tag="$RELEASE_TAG"
+            if [ "${tag#[vV]}" != "$version" ]; then
+              echo "::error::Release tag $tag doesn't match VERSION $version in CMakeLists.txt; bump it, or retag."
+              exit 1
+            fi
+            echo "name=CommunityGarage-${tag}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=CommunityGarage-v${version}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        run: |
+          export PATH=/opt/llvm-mingw/bin:$PATH
+          cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=platform/cmake/mingw-w64-x86_64.cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j "$(nproc)"
+          ls -l build/CommunityGarage.dll build/platform/d3dcompiler_47.dll
+
+      - name: Package the player zip
+        env:
+          BUILD_NAME: ${{ steps.name.outputs.name }}
+        run: bash packaging/package-player.sh build/CommunityGarage.dll build/platform/d3dcompiler_47.dll "dist/${BUILD_NAME}.zip"
+
+      - name: Upload the zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: dist/${{ steps.name.outputs.name }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.name }}
+          path: dist
+
+      - name: Attach the zip to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          ZIP: dist/${{ needs.build.outputs.name }}.zip
+        run: gh release upload "$TAG" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber

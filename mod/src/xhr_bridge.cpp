@@ -1,0 +1,612 @@
+#include "xhr_bridge.hpp"
+
+#include <windows.h>
+#include <winhttp.h>
+#include <objidl.h>
+#include <msxml6.h>
+
+#include <algorithm>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cctype>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+
+const FH2ModApi* g_api = nullptr;
+FH2Mod*          g_mod = nullptr;
+BridgeConfig     g_cfg;
+
+constexpr size_t kMaxBody = 64u * 1024 * 1024;
+
+// azimuth.exe 0.9.10 (PE timestamp 0x6AD14833): the OfflineRequest vtable and the
+// RVA each of its 13 slots points at (IUnknown, then IXMLHTTPRequest2 in order).
+constexpr DWORD    kAzimuthTimestamp = 0x6AD14833;
+constexpr uint32_t kVtableRva        = 0x2CCC60;
+constexpr uint32_t kSlotRva[13] = {0x1982D0, 0x198340, 0x198350, 0x1983B0, 0x198470, 0x1985A0, 0x198610,
+                                   0x198630, 0x198640, 0x198650, 0x198660, 0x198690, 0x1986D0};
+enum Slot { kQueryInterface, kAddRef, kRelease, kOpen, kSend, kAbort, kSetCookie, kSetCustomResponseStream,
+            kSetProperty, kSetRequestHeader, kGetAllResponseHeaders, kGetCookie, kGetResponseHeader };
+
+void logf(const char* fmt, ...) {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    g_api->log(g_mod, line);
+}
+
+std::string narrow(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+bool iequals(const std::wstring& a, const std::wstring& b) {
+    return a.size() == b.size() && CompareStringOrdinal(a.c_str(), (int)a.size(), b.c_str(), (int)b.size(), TRUE) == CSTR_EQUAL;
+}
+
+// ---- A readable in-memory ISequentialStream for the response body.
+
+struct MemStream final : ISequentialStream {
+    LONG                 refs = 1;
+    std::vector<uint8_t> data;
+    size_t               pos = 0;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_ISequentialStream) {
+            *ppv = static_cast<ISequentialStream*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&refs); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG n = InterlockedDecrement(&refs);
+        if (n == 0) delete this;
+        return (ULONG)n;
+    }
+    HRESULT STDMETHODCALLTYPE Read(void* pv, ULONG cb, ULONG* pcbRead) override {
+        size_t n = std::min<size_t>(cb, data.size() - pos);
+        if (n) std::memcpy(pv, data.data() + pos, n);
+        pos += n;
+        if (pcbRead) *pcbRead = (ULONG)n;
+        return n < cb ? S_FALSE : S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Write(const void*, ULONG, ULONG* pcbWritten) override {
+        if (pcbWritten) *pcbWritten = 0;
+        return E_NOTIMPL;
+    }
+};
+
+// ---- Per-request state, keyed by the stub object's address.
+
+struct Req {
+    std::wstring method, url;
+    std::vector<std::pair<std::wstring, std::wstring>> headers;
+    IXMLHTTPRequest2Callback* cb = nullptr;     // we hold a reference
+    ISequentialStream*        custom = nullptr; // we hold a reference
+    volatile LONG aborted = 0;
+    bool synthetic = false;                     // answered locally (Xbox Live privacy checks), never leaves the machine
+
+    DWORD        status = 0;
+    std::wstring statusText, rawHeaders;
+    std::vector<uint8_t> respBody;
+};
+
+std::mutex g_mu;
+std::unordered_map<void*, std::shared_ptr<Req>> g_reqs;
+
+std::shared_ptr<Req> find_req(void* self) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_reqs.find(self);
+    return it == g_reqs.end() ? nullptr : it->second;
+}
+
+void drop_refs(Req& r) {
+    if (r.cb) { r.cb->Release(); r.cb = nullptr; }
+    if (r.custom) { r.custom->Release(); r.custom = nullptr; }
+}
+
+// Original slot functions, saved by hook_pointer.
+void* g_orig[13] = {};
+using Fn_Release  = ULONG (STDMETHODCALLTYPE*)(void*);
+using Fn_AddRef   = ULONG (STDMETHODCALLTYPE*)(void*);
+using Fn_Open     = HRESULT (STDMETHODCALLTYPE*)(void*, LPCWSTR, LPCWSTR, IXMLHTTPRequest2Callback*, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR);
+using Fn_Send     = HRESULT (STDMETHODCALLTYPE*)(void*, ISequentialStream*, ULONGLONG);
+using Fn_Abort    = HRESULT (STDMETHODCALLTYPE*)(void*);
+using Fn_SetCookie = HRESULT (STDMETHODCALLTYPE*)(void*, const XHR_COOKIE*, DWORD*);
+using Fn_SetCustom = HRESULT (STDMETHODCALLTYPE*)(void*, ISequentialStream*);
+using Fn_SetProp  = HRESULT (STDMETHODCALLTYPE*)(void*, XHR_PROPERTY, ULONGLONG);
+using Fn_SetHdr   = HRESULT (STDMETHODCALLTYPE*)(void*, LPCWSTR, LPCWSTR);
+using Fn_GetAll   = HRESULT (STDMETHODCALLTYPE*)(void*, LPWSTR*);
+using Fn_GetCookie = HRESULT (STDMETHODCALLTYPE*)(void*, LPCWSTR, LPCWSTR, DWORD, ULONG*, XHR_COOKIE**);
+using Fn_GetHdr   = HRESULT (STDMETHODCALLTYPE*)(void*, LPCWSTR, LPWSTR*);
+
+template <class F> F orig(Slot s) { return reinterpret_cast<F>(g_orig[s]); }
+
+// ---- The HTTP work.
+
+LPWSTR co_string(const std::wstring& s) {
+    size_t bytes = (s.size() + 1) * sizeof(wchar_t);
+    auto* p = static_cast<LPWSTR>(CoTaskMemAlloc(bytes));
+    if (p) std::memcpy(p, s.c_str(), bytes);
+    return p;
+}
+
+// Case-insensitive lookup in the CRLF raw header block.
+bool header_value(const std::wstring& raw, const std::wstring& name, std::wstring& out) {
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t end = raw.find(L"\r\n", pos);
+        if (end == std::wstring::npos) end = raw.size();
+        size_t colon = raw.find(L':', pos);
+        if (colon != std::wstring::npos && colon < end && iequals(raw.substr(pos, colon - pos), name)) {
+            size_t v = colon + 1;
+            while (v < end && (raw[v] == L' ' || raw[v] == L'\t')) v++;
+            out = raw.substr(v, end - v);
+            return true;
+        }
+        pos = end + 2;
+    }
+    return false;
+}
+
+struct Closer {
+    HINTERNET h;
+    ~Closer() { if (h) WinHttpCloseHandle(h); }
+};
+
+// Performs the request; fills r.status/statusText/rawHeaders/respBody. Returns S_OK or an HRESULT.
+HRESULT do_http(Req& r, const std::vector<uint8_t>& body) {
+    URL_COMPONENTSW uc{};
+    uc.dwStructSize = sizeof uc;
+    wchar_t host[256], path[2048], extra[2048];
+    uc.lpszHostName = host;  uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;   uc.dwUrlPathLength = 2048;
+    uc.lpszExtraInfo = extra; uc.dwExtraInfoLength = 2048;
+    if (!WinHttpCrackUrl(r.url.c_str(), (DWORD)r.url.size(), 0, &uc)) return HRESULT_FROM_WIN32(GetLastError());
+
+    bool secure = g_cfg.scheme == 2 || (g_cfg.scheme == 0 && uc.nPort == 443);
+    std::wstring objectName = g_cfg.path_prefix + std::wstring(uc.lpszUrlPath, uc.dwUrlPathLength) + std::wstring(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+    std::wstring hostName(uc.lpszHostName, uc.dwHostNameLength);
+
+    std::wstring ua = L"Xls Client";
+    std::wstring hdrs;
+    for (auto& h : r.headers) {
+        if (iequals(h.first, L"User-Agent")) { ua = h.second; continue; }
+        if (iequals(h.first, L"Host") || iequals(h.first, L"Content-Length") || iequals(h.first, L"Connection")) continue;
+        if (h.second.empty()) continue;   // ADD|REPLACE with an empty value means "delete this header"
+        hdrs += h.first + L": " + h.second + L"\r\n";
+    }
+    if (iequals(std::wstring(uc.lpszHostName, uc.dwHostNameLength), g_cfg.host) && !g_cfg.key.empty()) {
+        // Identify this install to the community server (account key + display name).
+        auto wide = [](const std::string& s) { return std::wstring(s.begin(), s.end()); };
+        std::string enc;
+        for (unsigned char c : g_cfg.name) {
+            char tmp[4];
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.') { enc += (char)c; }
+            else { std::snprintf(tmp, sizeof tmp, "%%%02X", c); enc += tmp; }
+        }
+        hdrs += L"X-CT-Key: " + wide(g_cfg.key) + L"\r\n" + L"X-CT-Name: " + wide(enc) + L"\r\n";
+    }
+
+    bool local = iequals(hostName, L"localhost") || hostName == L"127.0.0.1" || hostName == L"::1";
+    Closer session{WinHttpOpen(ua.c_str(), local ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                               WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
+    if (!session.h) return HRESULT_FROM_WIN32(GetLastError());
+    WinHttpSetTimeouts(session.h, 5000, 5000, 15000, 30000);
+
+    Closer conn{WinHttpConnect(session.h, hostName.c_str(), uc.nPort, 0)};
+    if (!conn.h) return HRESULT_FROM_WIN32(GetLastError());
+
+    Closer req{WinHttpOpenRequest(conn.h, r.method.empty() ? L"POST" : r.method.c_str(), objectName.c_str(), nullptr,
+                                  WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0)};
+    if (!req.h) return HRESULT_FROM_WIN32(GetLastError());
+
+    if (secure && g_cfg.insecure_tls) {
+        DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                      SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(req.h, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof flags);
+    }
+    if (!hdrs.empty() && !WinHttpAddRequestHeaders(req.h, hdrs.c_str(), (DWORD)hdrs.size(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE))
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    DWORD len = (DWORD)body.size();
+    if (!WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0, len ? (LPVOID)body.data() : WINHTTP_NO_REQUEST_DATA, len, len, 0))
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (!WinHttpReceiveResponse(req.h, nullptr)) return HRESULT_FROM_WIN32(GetLastError());
+
+    DWORD size = sizeof r.status;
+    r.status = 0;
+    WinHttpQueryHeaders(req.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &r.status, &size, WINHTTP_NO_HEADER_INDEX);
+
+    auto query_str = [&](DWORD what) {
+        DWORD bytes = 0;
+        WinHttpQueryHeaders(req.h, what, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &bytes, WINHTTP_NO_HEADER_INDEX);
+        std::wstring s(bytes / sizeof(wchar_t), L'\0');
+        if (bytes && WinHttpQueryHeaders(req.h, what, WINHTTP_HEADER_NAME_BY_INDEX, s.data(), &bytes, WINHTTP_NO_HEADER_INDEX))
+            s.resize(bytes / sizeof(wchar_t));
+        else
+            s.clear();
+        return s;
+    };
+    r.statusText = query_str(WINHTTP_QUERY_STATUS_TEXT);
+    r.rawHeaders = query_str(WINHTTP_QUERY_RAW_HEADERS_CRLF);
+
+    for (;;) {
+        DWORD avail = 0;
+        if (!WinHttpQueryDataAvailable(req.h, &avail)) return HRESULT_FROM_WIN32(GetLastError());
+        if (!avail) break;
+        if (r.respBody.size() + avail > kMaxBody) return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
+        size_t at = r.respBody.size();
+        r.respBody.resize(at + avail);
+        DWORD got = 0;
+        if (!WinHttpReadData(req.h, r.respBody.data() + at, avail, &got)) return HRESULT_FROM_WIN32(GetLastError());
+        r.respBody.resize(at + got);
+        if (!got) break;
+    }
+    return S_OK;
+}
+
+// Xbox Live's privacy service decides whether the player may share user-created content. There is no Xbox Live
+// to ask, so every check is answered "allowed". The JSON follows XSAPI's PermissionCheckResult deserializer.
+HRESULT do_synthetic(Req& r, const std::vector<uint8_t>& body) {
+    std::string reply;
+    if (r.url.find(L"/users/batch/profile/settings") != std::wstring::npos) {
+        // Profile service (gamertags for other players / drivatars). Echo every requested user with each requested
+        // setting set to a generic name, so name plates have text instead of boxes.
+        std::string in(body.begin(), body.end());
+        if (g_cfg.debug) logf("profile settings request body: %.300s", in.c_str());
+        auto strings_after = [&](const char* key) {
+            std::vector<std::string> out;
+            size_t at = in.find(key);
+            if (at == std::string::npos) return out;
+            size_t lb = in.find('[', at), rb = in.find(']', at);
+            if (lb == std::string::npos || rb == std::string::npos) return out;
+            for (size_t i = lb; i < rb; i++) {
+                if (in[i] != '"') continue;
+                size_t e = in.find('"', i + 1);
+                if (e == std::string::npos || e > rb) break;
+                out.push_back(in.substr(i + 1, e - i - 1));
+                i = e;
+            }
+            return out;
+        };
+        auto users = strings_after("userIds");
+        auto settings = strings_after("settings");
+        reply = "{" + std::string(1, '"') + "profileUsers" + std::string(1, '"') + ":[";
+        for (size_t u = 0; u < users.size(); u++) {
+            reply += std::string(u ? "," : "") + "{\"id\":\"" + users[u] + "\",\"hostId\":\"" + users[u] + "\",\"settings\":[";
+            for (size_t s = 0; s < settings.size(); s++) {
+                bool name = settings[s].find("amertag") != std::string::npos || settings[s].find("Name") != std::string::npos;
+                reply += std::string(s ? "," : "") + "{\"id\":\"" + settings[s] + "\",\"value\":\"" + (name ? "Racer" : "") + "\"}";
+            }
+            reply += "],\"isSponsoredUser\":false}";
+        }
+        reply += "]}";
+    } else if (r.url.find(L"/system/strings/validate") != std::wstring::npos) {
+        // String verification (profanity filter) for the description/keywords: one "OK" result per string sent.
+        // The request body's first JSON array holds the strings; count its elements.
+        std::string in(body.begin(), body.end());
+        if (g_cfg.debug) logf("string validate request body: %.400s", in.c_str());
+        int count = 0, depth = 0;
+        bool inStr = false, started = false;
+        for (size_t i = 0; i < in.size(); i++) {
+            char c = in[i];
+            if (inStr) { if (c == '\\') i++; else if (c == '"') inStr = false; continue; }
+            if (c == '"') { inStr = true; if (started && depth == 1) count++; }
+            else if (c == '[') { depth++; started = true; }
+            else if (c == '{' && started && depth == 1) { count++; depth++; }
+            else if (c == '{') depth++;
+            else if (c == ']' || c == '}') { depth--; if (started && depth == 0) break; }
+        }
+        reply = "{\"verifyStringResult\":[";
+        for (int i = 0; i < count; i++) reply += std::string(i ? "," : "") + "{\"resultCode\":0,\"firstOffendingSubstring\":\"\"}";
+        reply += "]}";
+    } else if (r.method == L"GET") {
+        reply = "{\"isAllowed\":true,\"permissionRequested\":\"\",\"reasons\":[]}";
+    } else {
+        // Batch check: echo each requested user back with every permission allowed. The exact shape is a guess;
+        // the request body is logged so it can be corrected.
+        std::string in(body.begin(), body.end());
+        if (g_cfg.debug) logf("privacy batch request body: %.600s", in.c_str());
+        reply = "{\"responses\":[]}";
+    }
+    r.status = 200;
+    r.statusText = L"OK";
+    r.rawHeaders = L"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + std::to_wstring(reply.size()) + L"\r\n\r\n";
+    r.respBody.assign(reply.begin(), reply.end());
+    return S_OK;
+}
+
+struct Job {
+    void*                self;
+    std::shared_ptr<Req> req;
+    std::vector<uint8_t> body;
+};
+
+DWORD WINAPI worker(LPVOID param) {
+    std::unique_ptr<Job> job(static_cast<Job*>(param));
+    Req& r = *job->req;
+    void* self = job->self;
+    auto* xhr = reinterpret_cast<IXMLHTTPRequest2*>(self);
+
+    {
+        static LONG shown = 0;
+        LONG nth = InterlockedIncrement(&shown);
+        std::string xmethod;
+        for (auto& h : r.headers) if (iequals(h.first, L"X-Method")) xmethod = narrow(h.second);
+        if (g_cfg.debug && nth <= 600) logf("request #%ld %s (%zu body bytes)", nth, xmethod.c_str(), job->body.size());
+        if (g_cfg.debug && nth <= 6) {
+            std::string hs;
+            for (auto& h : r.headers) hs += narrow(h.first) + "=[" + narrow(h.second) + "] ";
+            logf("request %s %s, %zu body bytes, headers: %s", narrow(r.method).c_str(), narrow(r.url).c_str(),
+                 job->body.size(), hs.c_str());
+            if (!job->body.empty()) {
+                char hex[3 * 48 + 8] = {};
+                int len = 0;
+                for (size_t i = 0; i < job->body.size() && i < 48; i++)
+                    len += std::snprintf(hex + len, sizeof hex - len, "%02x ", job->body[i]);
+                logf("  body starts: %s", hex);
+            }
+        }
+    }
+    DWORD t0 = GetTickCount();
+    bool probe = false;
+    if (g_cfg.fail_economy) {
+        for (auto& h : r.headers) if (iequals(h.first, L"X-Method") && iequals(h.second, L"GetEconomySettings")) probe = true;
+        if (probe) logf("economy_probe: failing GetEconomySettings on purpose, the game keeps its built-in economy values");
+    }
+    HRESULT hr = InterlockedCompareExchange(&r.aborted, 0, 0) ? HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED)
+                                                               : (probe ? HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE) : (r.synthetic ? do_synthetic(r, job->body) : do_http(r, job->body)));
+
+    IXMLHTTPRequest2Callback* cb = r.cb;
+    if (SUCCEEDED(hr)) {
+        // The game reads Content-Length from the request object in OnHeadersAvailable
+        // (GetResponseHeader), then keeps the stream it gets in OnDataAvailable and
+        // signals completion from OnResponseReceived.
+        if (g_cfg.debug || r.status >= 400) logf("%s %s -> %lu, %zu bytes, %lu ms", narrow(r.method).c_str(), narrow(r.url).c_str(), (unsigned long)r.status,
+             r.respBody.size(), (unsigned long)(GetTickCount() - t0));
+        if (cb) {
+            MemStream* ms = nullptr;
+            if (r.custom) {
+                size_t off = 0;
+                while (off < r.respBody.size()) {
+                    ULONG wrote = 0;
+                    if (FAILED(r.custom->Write(r.respBody.data() + off, (ULONG)(r.respBody.size() - off), &wrote)) || !wrote) break;
+                    off += wrote;
+                }
+            } else {
+                ms = new MemStream();
+                ms->data = r.respBody;
+            }
+            cb->OnHeadersAvailable(xhr, r.status, r.statusText.c_str());
+            cb->OnDataAvailable(xhr, ms);
+            cb->OnResponseReceived(xhr, ms);
+            if (ms) ms->Release();
+        }
+    } else {
+        logf("%s %s FAILED: 0x%08lx (%lu ms)", narrow(r.method).c_str(), narrow(r.url).c_str(), (unsigned long)hr,
+             (unsigned long)(GetTickCount() - t0));
+        if (cb) cb->OnError(xhr, hr);
+    }
+
+    // Done with the callback; drop our references, then the one Send took on the stub.
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        drop_refs(r);
+    }
+    reinterpret_cast<Fn_Release>((*reinterpret_cast<void***>(self))[kRelease])(self);
+    return 0;
+}
+
+// ---- Detours. Requests we don't own fall through to the stub's own behaviour.
+
+ULONG STDMETHODCALLTYPE d_Release(void* self) {
+    ULONG n = orig<Fn_Release>(kRelease)(self);
+    if (n == 0) {
+        std::shared_ptr<Req> r;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            auto it = g_reqs.find(self);
+            if (it != g_reqs.end()) { r = it->second; g_reqs.erase(it); }
+        }
+        if (r) { std::lock_guard<std::mutex> lk(g_mu); drop_refs(*r); }
+    }
+    return n;
+}
+
+HRESULT STDMETHODCALLTYPE d_Open(void* self, LPCWSTR method, LPCWSTR url, IXMLHTTPRequest2Callback* cb,
+                                 LPCWSTR u, LPCWSTR p, LPCWSTR pu, LPCWSTR pp) {
+    if (method && url && cb) {
+        URL_COMPONENTSW uc{};
+        uc.dwStructSize = sizeof uc;
+        wchar_t host[256];
+        uc.lpszHostName = host;
+        uc.dwHostNameLength = 256;
+        std::wstring h;
+        bool cracked = WinHttpCrackUrl(url, 0, 0, &uc);
+        if (cracked) h.assign(uc.lpszHostName, uc.dwHostNameLength);
+        bool privacy = cracked && (iequals(h, L"privacy.xboxlive.com") || iequals(h, L"client-strings.xboxlive.com") || iequals(h, L"profile.xboxlive.com"));
+        if (cracked && (privacy || iequals(h, g_cfg.host))) {
+            auto r = std::make_shared<Req>();
+            r->synthetic = privacy;
+            r->method = method;
+            r->url = url;
+            r->cb = cb;
+            cb->AddRef();
+            std::lock_guard<std::mutex> lk(g_mu);
+            g_reqs[self] = r;
+            return S_OK;
+        }
+    }
+    {
+        // Not ours: it stays offline. Log what the game tried, to spot calls (uploads, downloads) that need a host.
+        static LONG others = 0;
+        if (g_cfg.debug && url && InterlockedIncrement(&others) <= 80)
+            logf("not forwarded (other host): %s %s", method ? narrow(method).c_str() : "?", narrow(url).c_str());
+    }
+    return orig<Fn_Open>(kOpen)(self, method, url, cb, u, p, pu, pp);
+}
+
+HRESULT STDMETHODCALLTYPE d_Send(void* self, ISequentialStream* body, ULONGLONG cbBody) {
+    auto r = find_req(self);
+    if (!r) return orig<Fn_Send>(kSend)(self, body, cbBody);
+
+    auto job = std::make_unique<Job>();
+    job->self = self;
+    job->req = r;
+    if (body) {
+        uint8_t buf[4096];
+        for (;;) {
+            ULONG got = 0;
+            HRESULT hr = body->Read(buf, sizeof buf, &got);
+            if (got) job->body.insert(job->body.end(), buf, buf + got);
+            if (FAILED(hr) || !got || (cbBody && job->body.size() >= cbBody) || job->body.size() > kMaxBody) break;
+        }
+    }
+    // Keep the stub object alive until the worker is done with it.
+    reinterpret_cast<Fn_AddRef>((*reinterpret_cast<void***>(self))[kAddRef])(self);
+    Job* raw = job.release();
+    if (!QueueUserWorkItem(worker, raw, WT_EXECUTELONGFUNCTION)) {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        delete raw;
+        reinterpret_cast<Fn_Release>((*reinterpret_cast<void***>(self))[kRelease])(self);
+        return hr;
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE d_Abort(void* self) {
+    auto r = find_req(self);
+    if (!r) return orig<Fn_Abort>(kAbort)(self);
+    InterlockedExchange(&r->aborted, 1);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE d_SetCookie(void* self, const XHR_COOKIE* c, DWORD* state) {
+    if (!find_req(self)) return orig<Fn_SetCookie>(kSetCookie)(self, c, state);
+    if (state) *state = 0;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE d_SetCustomResponseStream(void* self, ISequentialStream* s) {
+    auto r = find_req(self);
+    if (!r) return orig<Fn_SetCustom>(kSetCustomResponseStream)(self, s);
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (r->custom) r->custom->Release();
+    r->custom = s;
+    if (s) s->AddRef();
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE d_SetProperty(void* self, XHR_PROPERTY prop, ULONGLONG value) {
+    if (!find_req(self)) return orig<Fn_SetProp>(kSetProperty)(self, prop, value);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE d_SetRequestHeader(void* self, LPCWSTR name, LPCWSTR value) {
+    auto r = find_req(self);
+    if (!r) return orig<Fn_SetHdr>(kSetRequestHeader)(self, name, value);
+    if (!name) return E_INVALIDARG;
+    std::lock_guard<std::mutex> lk(g_mu);
+    r->headers.emplace_back(name, value ? value : L"");
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE d_GetAllResponseHeaders(void* self, LPWSTR* out) {
+    auto r = find_req(self);
+    if (!r) return orig<Fn_GetAll>(kGetAllResponseHeaders)(self, out);
+    if (!out) return E_POINTER;
+    *out = co_string(r->rawHeaders);
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+
+HRESULT STDMETHODCALLTYPE d_GetCookie(void* self, LPCWSTR url, LPCWSTR name, DWORD flags, ULONG* count, XHR_COOKIE** cookies) {
+    if (!find_req(self)) return orig<Fn_GetCookie>(kGetCookie)(self, url, name, flags, count, cookies);
+    if (count) *count = 0;
+    if (cookies) *cookies = nullptr;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE d_GetResponseHeader(void* self, LPCWSTR name, LPWSTR* out) {
+    auto r = find_req(self);
+    if (!r) return orig<Fn_GetHdr>(kGetResponseHeader)(self, name, out);
+    if (!name || !out) return E_POINTER;
+    *out = nullptr;
+    std::wstring v;
+    if (!header_value(r->rawHeaders, name, v)) {
+        // The game asks for Content-Length before it has the body; we read the whole body first.
+        if (iequals(name, L"Content-Length")) v = std::to_wstring(r->respBody.size());
+        else return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+    *out = co_string(v);
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+
+} // namespace
+
+bool xhr_bridge_install(const FH2ModApi* api, FH2Mod* mod, const BridgeConfig& cfg) {
+    g_api = api;
+    g_mod = mod;
+    g_cfg = cfg;
+    if (api->api_version < 3) {
+        logf("HTTP bridge needs platform API 3 (hook_pointer)");
+        return false;
+    }
+
+    auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    auto* nt   = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->FileHeader.TimeDateStamp != kAzimuthTimestamp) {
+        logf("HTTP bridge: azimuth.exe build 0x%08lx isn't the one this was written for (0x%08lx); not hooking",
+             (unsigned long)nt->FileHeader.TimeDateStamp, (unsigned long)kAzimuthTimestamp);
+        return false;
+    }
+    auto** vt = reinterpret_cast<void**>(base + kVtableRva);
+    for (int i = 0; i < 13; i++) {
+        if (reinterpret_cast<uint8_t*>(vt[i]) != base + kSlotRva[i]) {
+            logf("HTTP bridge: OfflineRequest vtable slot %d isn't where expected; not hooking", i);
+            return false;
+        }
+    }
+
+    struct H { Slot slot; void* detour; const char* name; };
+    const H hooks[] = {
+        {kRelease, (void*)d_Release, "OfflineRequest::Release"},
+        {kOpen, (void*)d_Open, "OfflineRequest::Open"},
+        {kSend, (void*)d_Send, "OfflineRequest::Send"},
+        {kAbort, (void*)d_Abort, "OfflineRequest::Abort"},
+        {kSetCookie, (void*)d_SetCookie, "OfflineRequest::SetCookie"},
+        {kSetCustomResponseStream, (void*)d_SetCustomResponseStream, "OfflineRequest::SetCustomResponseStream"},
+        {kSetProperty, (void*)d_SetProperty, "OfflineRequest::SetProperty"},
+        {kSetRequestHeader, (void*)d_SetRequestHeader, "OfflineRequest::SetRequestHeader"},
+        {kGetAllResponseHeaders, (void*)d_GetAllResponseHeaders, "OfflineRequest::GetAllResponseHeaders"},
+        {kGetCookie, (void*)d_GetCookie, "OfflineRequest::GetCookie"},
+        {kGetResponseHeader, (void*)d_GetResponseHeader, "OfflineRequest::GetResponseHeader"},
+    };
+    // AddRef (slot 1) is left alone; d_Send/worker call it through the vtable.
+    g_orig[kAddRef] = vt[kAddRef];
+
+    bool ok = true;
+    for (const H& h : hooks) {
+        FH2Hook* hook = api->hook_pointer(mod, h.name, &vt[h.slot], h.detour, &g_orig[h.slot]);
+        ok = ok && hook && api->enable_hooks(mod, hook);
+    }
+    logf("HTTP bridge %s: requests to %s go over WinHTTP (scheme %s%s)", ok ? "installed" : "FAILED",
+         narrow(cfg.host).c_str(), cfg.scheme == 0 ? "auto" : cfg.scheme == 1 ? "http" : "https",
+         cfg.insecure_tls ? ", insecure TLS allowed" : "");
+    return ok;
+}
