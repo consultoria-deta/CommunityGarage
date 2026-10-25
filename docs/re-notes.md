@@ -75,6 +75,19 @@ orphans those ids; a modified/new tune is needed.
   ({u32 4, u32 0}) and stop spawning free-roam AI. Reply with an error instead; delete that file once to recover.
 - Made-up drivatar records (skills zeroed) are ignored/harmful; `SERVE_DRIVATARS=1` enables them for experiments only.
 - WheresMyBuddy only rewrites local DefaultCache.bin / AIPlayers.str names; it does not conflict with this mod.
+- A tune's InstalledParts are upgrade row ids of its own car (`carId*1000 + n`, e.g. 2042000 = car 2042's stock drivetrain).
+  The car builder at game+0x1056210 looks each one up for the car it is building; the engine/motor rows are null-checked, the
+  drivetrain row (`[rbp+0x518]`) is not, so a tune applied to another car crashes at game+0x1056BAE reading "DrivetrainID"
+  (crash 2026-10-25 22:49). `FileSummary.Ordinal` is the file's car: the server must send the car id there (it sent the list
+  index), and never list a tune without a known car.
+- The builder's r8 is a car setup record: u32 carId, u32 x2 (swaps), 43 u32 part ids (copied from +4, 0xB4 bytes), byte +0x168 =
+  use stock parts. The crash (2026-10-25 23:07, detailed log) followed GetMyFileList -> GetFileHeavyWeightData ->
+  RetrieveVersionedTuneById: a My Files tune for another car applied to the current one. The mod's "car builder: foreign tune
+  parts" hook (game+0x1056263) passes a copy with the stock flag set when car-level slots (0-11, 34-41) name another car.
+  That avoids the crash but fits stock parts (the rims changed). The caller (game+0xAF1559) builds the record from the current
+  car id plus all 45 values of the tune, so the car's own parts are not at hand there. The XHR bridge now refuses such a tune
+  earlier: it remembers the car from GetCuratedContent / SearchTuningFiles (body offset 4) and answers a RetrieveVersionedTuneById
+  whose CarId (reply offset 12) differs with an error reply; the builder guard stays as a backstop.
 
 ## Clubs tab (2026-10-25)
 The Clubs tab came on once the game was logged in to the community server (it was locked offline). Failing the CarClub calls

@@ -337,17 +337,41 @@ struct Job {
     std::vector<uint8_t> body;
 };
 
+// The car the tune menus were last opened for. The game asks for the Suggested list (GetCuratedContent {ContentType u32, CarId i32,
+// ...}) and searches (SearchParameters {MakeId, ModelId, ...}) with the current car, but lets a My Files tune made for another
+// car be applied to it: that tune's parts don't exist on this car (crash, or stock parts under the car-builder guard). So a
+// downloaded tune (RetrieveVersionedTuneById reply: 12-byte header, then CarId u32) for a different car is answered with an error.
+volatile LONG g_menu_car = 0;
+
+uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+void refuse_foreign_tune(Req& r) {
+    LONG car = g_menu_car;
+    if (car <= 0 || r.status != 200 || r.respBody.size() < 16 || be32(r.respBody.data()) != 0) return;   // kind 0: a success reply
+    uint32_t tune_car = be32(r.respBody.data() + 12);
+    if (tune_car == (uint32_t)car) return;
+    logf("a downloaded tune is for car %lu, not the current car %ld: refused, so the game leaves the car as it is", (unsigned long)tune_car, car);
+    static const char kText[] = "This tune was made for a different car.";
+    uint8_t head[12] = {0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, (uint8_t)(sizeof kText - 1)};    // error reply: kind 2, code 1, text length
+    r.respBody.assign(head, head + sizeof head);
+    r.respBody.insert(r.respBody.end(), kText, kText + sizeof kText - 1);
+}
+
 DWORD WINAPI worker(LPVOID param) {
     std::unique_ptr<Job> job(static_cast<Job*>(param));
     Req& r = *job->req;
     void* self = job->self;
     auto* xhr = reinterpret_cast<IXMLHTTPRequest2*>(self);
 
+    std::string xmethod;
+    for (auto& h : r.headers) if (iequals(h.first, L"X-Method")) xmethod = narrow(h.second);
+    if ((xmethod == "GetCuratedContent" || xmethod == "SearchTuningFiles") && job->body.size() >= 8) {
+        LONG car = (LONG)be32(job->body.data() + 4);
+        if (car > 0) InterlockedExchange(&g_menu_car, car);
+    }
     {
         static LONG shown = 0;
         LONG nth = InterlockedIncrement(&shown);
-        std::string xmethod;
-        for (auto& h : r.headers) if (iequals(h.first, L"X-Method")) xmethod = narrow(h.second);
         if (g_cfg.debug && nth <= 600) logf("request #%ld %s (%zu body bytes)", nth, xmethod.c_str(), job->body.size());
         if (g_cfg.debug && nth <= 6) {
             std::string hs;
@@ -372,6 +396,7 @@ DWORD WINAPI worker(LPVOID param) {
     HRESULT hr = InterlockedCompareExchange(&r.aborted, 0, 0) ? HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED)
                                                                : (probe ? HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE) : (r.synthetic ? do_synthetic(r, job->body) : do_http(r, job->body)));
 
+    if (SUCCEEDED(hr) && xmethod == "RetrieveVersionedTuneById") refuse_foreign_tune(r);
     IXMLHTTPRequest2Callback* cb = r.cb;
     if (SUCCEEDED(hr)) {
         // The game reads Content-Length from the request object in OnHeadersAvailable

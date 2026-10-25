@@ -295,6 +295,32 @@ void on_empty_datetime(FH2Context* ctx, void*) {
     }
 }
 
+// The car builder (game+0x1056210) takes a car setup record in r8: u32 carId, two u32 swap fields, then 43 u32 upgrade part ids,
+// and at +0x168 a byte "use stock parts". Car-level part ids are carId*1000 + n, so a tune made on another car (the game will
+// apply one from My Files to the current car) names parts this car doesn't have; the drivetrain lookup then comes back empty and
+// the game crashes at game+0x1056BAE. Hooked at `mov rdi, r9` (game+0x1056263), before the record is read: if a car-level part
+// belongs to another car, hand the builder a copy with the stock-parts flag set. The function reads only those fields of it.
+bool safe_read(const void* p, void* out, size_t n);
+void on_car_build(FH2Context* ctx, void*) {
+    const auto* rec = reinterpret_cast<const uint8_t*>(ctx->r8);
+    uint32_t car = 0;
+    uint8_t stock = 0;
+    if (!rec || !safe_read(rec, &car, 4) || !safe_read(rec + 0x168, &stock, 1) || stock || !car) return;
+    uint32_t parts[43];
+    if (!safe_read(rec + 12, parts, sizeof parts)) return;
+    uint32_t foreign = 0;
+    for (int i : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 34, 35, 36, 37, 38, 39, 40, 41})   // car-level slots (12..33: engine, drivetrain)
+        if (parts[i] != 0xFFFFFFFFu && parts[i] / 1000 != car) { foreign = parts[i] / 1000; break; }
+    if (!foreign) return;
+    thread_local uint8_t copy[0x170];
+    std::memcpy(copy, rec, sizeof copy);
+    copy[0x168] = 1;
+    ctx->r8 = reinterpret_cast<uint64_t>(copy);
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 10)
+        logf("car %u was given upgrade parts of car %u (a tune made for another car); building it with stock parts instead", car, foreign);
+}
+
 // ---- Reply-layout probes. The reader walks the reply field by field; log where each array and
 // date is read (stream offset, count) so we can see where fields like notificationNonce sit.
 
@@ -895,6 +921,8 @@ DWORD WINAPI worker(LPVOID) {
                                 on_token_strings, nullptr);
         g_api->hook_instruction(g_mod, "token callback result", reinterpret_cast<void*>(base + (0x141C541A5 - kImageBase)),
                                 on_token_callback, nullptr);
+        g_api->hook_instruction(g_mod, "car builder: foreign tune parts", reinterpret_cast<void*>(base + (0x141056263 - kImageBase)),
+                                on_car_build, nullptr);
     }
     g_api->hook_function(g_mod, "logon-response listener (skipped)", reinterpret_cast<void*>(base + (0x1409C88E0 - kImageBase)),
                          reinterpret_cast<void*>(&listener_skip), reinterpret_cast<void**>(&g_listener_orig));
