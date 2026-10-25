@@ -6,6 +6,9 @@ server. The game's Share, Find, Suggested and download screens work again, as th
 > Unofficial fan project for the PC version of Forza Horizon 2 running on Azimuth. Not affiliated with, endorsed by or
 > connected to Microsoft, Turn 10 Studios or Playground Games. Forza and related names belong to their owners.
 
+<img width="816" height="459" alt="image" src="https://github.com/user-attachments/assets/07bfd071-9139-4313-8827-5e06de09f15c" />
+<img width="816" height="459" alt="image" src="https://github.com/user-attachments/assets/d55c46c3-2a69-41f3-8a55-265ffe786a5e" />
+
 ## What it does
 
 - **Share** your liveries, tunes and group vinyls with the Share option you already know.
