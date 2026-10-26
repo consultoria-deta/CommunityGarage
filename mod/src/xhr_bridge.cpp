@@ -199,7 +199,10 @@ HRESULT do_http(Req& r, const std::vector<uint8_t>& body) {
             if (std::isalnum(c) || c == '-' || c == '_' || c == '.') { enc += (char)c; }
             else { std::snprintf(tmp, sizeof tmp, "%%%02X", c); enc += tmp; }
         }
-        hdrs += L"X-CT-Key: " + wide(g_cfg.key) + L"\r\n" + L"X-CT-Name: " + wide(enc) + L"\r\n";
+        hdrs += L"X-CT-Key: " + wide(g_cfg.key) + L"\r\n";
+        // An empty value with ADD|REPLACE means "delete this header" and fails with ERROR_WINHTTP_HEADER_NOT_FOUND
+        // (0x80072f76), so a player with no gamertag configured must not send the header at all.
+        if (!enc.empty()) hdrs += L"X-CT-Name: " + wide(enc) + L"\r\n";
     }
 
     bool local = iequals(hostName, L"localhost") || hostName == L"127.0.0.1" || hostName == L"::1";
@@ -220,8 +223,11 @@ HRESULT do_http(Req& r, const std::vector<uint8_t>& body) {
                       SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
         WinHttpSetOption(req.h, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof flags);
     }
-    if (!hdrs.empty() && !WinHttpAddRequestHeaders(req.h, hdrs.c_str(), (DWORD)hdrs.size(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE))
-        return HRESULT_FROM_WIN32(GetLastError());
+    if (!hdrs.empty() && !WinHttpAddRequestHeaders(req.h, hdrs.c_str(), (DWORD)hdrs.size(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) {
+        DWORD err = GetLastError();
+        logf("WinHttpAddRequestHeaders failed (error %lu); headers were: %s", (unsigned long)err, narrow(hdrs).c_str());
+        return HRESULT_FROM_WIN32(err);
+    }
 
     DWORD len = (DWORD)body.size();
     if (!WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0, len ? (LPVOID)body.data() : WINHTTP_NO_REQUEST_DATA, len, len, 0))
