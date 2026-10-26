@@ -168,6 +168,24 @@ struct Closer {
     ~Closer() { if (h) WinHttpCloseHandle(h); }
 };
 
+// A WinHTTP call said no: log which one and how far the response had got, and turn its error into an HRESULT.
+// Last error is cleared before every WinHTTP call, so the code seen here is that call's own and not a leftover
+// (query_str provokes ERROR_INSUFFICIENT_BUFFER on purpose, for instance).
+HRESULT http_failed(const Req& r, const char* step) {
+    DWORD e = GetLastError();
+    logf("%s %s: %s failed, win32 error %lu (0x%08lx), HTTP status %lu, %zu body bytes read", narrow(r.method).c_str(),
+         narrow(r.url).c_str(), step, (unsigned long)e, (unsigned long)e, (unsigned long)r.status, r.respBody.size());
+    return e ? HRESULT_FROM_WIN32(e) : E_FAIL;
+}
+
+// The one refusal that means "end of body" rather than "the transfer broke" is Wine 11's ERROR_INSUFFICIENT_BUFFER at
+// the end of a chunked reply (dlls/winhttp/request.c: refill_buffer, read_more_data and start_next_chunk answer it once
+// read_chunked_eof is set). Every other code is a lost response: WinHTTP's own (12xxx), Winsock's (10xxx), and the raw
+// SEC_E_* status Wine hands back when a TLS record is cut short (dlls/winhttp/net.c read_ssl_chunk returns
+// SEC_E_INCOMPLETE_MESSAGE 0x80090318 when the peer closes mid-record, or DecryptMessage's own failure), which is how a
+// dropped HTTPS connection shows up on the Deck. Windows never reports ERROR_INSUFFICIENT_BUFFER from these two calls.
+bool chunked_eof_quirk(DWORD e) { return e == ERROR_INSUFFICIENT_BUFFER; }
+
 // Performs the request; fills r.status/statusText/rawHeaders/respBody. Returns S_OK or an HRESULT.
 HRESULT do_http(Req& r, const std::vector<uint8_t>& body) {
     URL_COMPONENTSW uc{};
@@ -176,7 +194,9 @@ HRESULT do_http(Req& r, const std::vector<uint8_t>& body) {
     uc.lpszHostName = host;  uc.dwHostNameLength = 256;
     uc.lpszUrlPath = path;   uc.dwUrlPathLength = 2048;
     uc.lpszExtraInfo = extra; uc.dwExtraInfoLength = 2048;
-    if (!WinHttpCrackUrl(r.url.c_str(), (DWORD)r.url.size(), 0, &uc)) return HRESULT_FROM_WIN32(GetLastError());
+    r.status = 0;
+    SetLastError(0);
+    if (!WinHttpCrackUrl(r.url.c_str(), (DWORD)r.url.size(), 0, &uc)) return http_failed(r, "WinHttpCrackUrl");
 
     bool secure = g_cfg.scheme == 2 || (g_cfg.scheme == 0 && uc.nPort == 443);
     std::wstring objectName = g_cfg.path_prefix + std::wstring(uc.lpszUrlPath, uc.dwUrlPathLength) + std::wstring(uc.lpszExtraInfo, uc.dwExtraInfoLength);
@@ -203,39 +223,49 @@ HRESULT do_http(Req& r, const std::vector<uint8_t>& body) {
     }
 
     bool local = iequals(hostName, L"localhost") || hostName == L"127.0.0.1" || hostName == L"::1";
+    SetLastError(0);
     Closer session{WinHttpOpen(ua.c_str(), local ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
-    if (!session.h) return HRESULT_FROM_WIN32(GetLastError());
+    if (!session.h) return http_failed(r, "WinHttpOpen");
+    SetLastError(0);
     WinHttpSetTimeouts(session.h, 5000, 5000, 15000, 30000);
 
+    SetLastError(0);
     Closer conn{WinHttpConnect(session.h, hostName.c_str(), uc.nPort, 0)};
-    if (!conn.h) return HRESULT_FROM_WIN32(GetLastError());
+    if (!conn.h) return http_failed(r, "WinHttpConnect");
 
+    SetLastError(0);
     Closer req{WinHttpOpenRequest(conn.h, r.method.empty() ? L"POST" : r.method.c_str(), objectName.c_str(), nullptr,
                                   WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0)};
-    if (!req.h) return HRESULT_FROM_WIN32(GetLastError());
+    if (!req.h) return http_failed(r, "WinHttpOpenRequest");
 
     if (secure && g_cfg.insecure_tls) {
         DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
                       SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        SetLastError(0);
         WinHttpSetOption(req.h, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof flags);
     }
+    SetLastError(0);
     if (!hdrs.empty() && !WinHttpAddRequestHeaders(req.h, hdrs.c_str(), (DWORD)hdrs.size(), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE))
-        return HRESULT_FROM_WIN32(GetLastError());
+        return http_failed(r, "WinHttpAddRequestHeaders");
 
     DWORD len = (DWORD)body.size();
+    SetLastError(0);
     if (!WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0, len ? (LPVOID)body.data() : WINHTTP_NO_REQUEST_DATA, len, len, 0))
-        return HRESULT_FROM_WIN32(GetLastError());
-    if (!WinHttpReceiveResponse(req.h, nullptr)) return HRESULT_FROM_WIN32(GetLastError());
+        return http_failed(r, "WinHttpSendRequest");
+    SetLastError(0);
+    if (!WinHttpReceiveResponse(req.h, nullptr)) return http_failed(r, "WinHttpReceiveResponse");
 
     DWORD size = sizeof r.status;
-    r.status = 0;
+    SetLastError(0);
     WinHttpQueryHeaders(req.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &r.status, &size, WINHTTP_NO_HEADER_INDEX);
 
     auto query_str = [&](DWORD what) {
         DWORD bytes = 0;
-        WinHttpQueryHeaders(req.h, what, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &bytes, WINHTTP_NO_HEADER_INDEX);
+        SetLastError(0);
+        WinHttpQueryHeaders(req.h, what, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &bytes, WINHTTP_NO_HEADER_INDEX);   // sizes: fails with ERROR_INSUFFICIENT_BUFFER by design
         std::wstring s(bytes / sizeof(wchar_t), L'\0');
+        SetLastError(0);
         if (bytes && WinHttpQueryHeaders(req.h, what, WINHTTP_HEADER_NAME_BY_INDEX, s.data(), &bytes, WINHTTP_NO_HEADER_INDEX))
             s.resize(bytes / sizeof(wchar_t));
         else
@@ -245,17 +275,45 @@ HRESULT do_http(Req& r, const std::vector<uint8_t>& body) {
     r.statusText = query_str(WINHTTP_QUERY_STATUS_TEXT);
     r.rawHeaders = query_str(WINHTTP_QUERY_RAW_HEADERS_CRLF);
 
-    for (;;) {
+    // Body. The header block is complete here. One refusal from WinHttpQueryDataAvailable/WinHttpReadData is the end
+    // of the body (chunked_eof_quirk); every other one fails the request. Wine 11's winhttp
+    // (dlls/winhttp/request.c: get_chunk_size sets read_chunked_eof inside query_data_available, after the
+    // end_of_read_data check, so refill_buffer answers ERROR_INSUFFICIENT_BUFFER) fails the first
+    // WinHttpQueryDataAvailable of every chunked reply whose closing "0" chunk arrived with the headers, i.e. every
+    // empty chunked reply such as the community server's 401 behind Cloudflare; Windows reports 0 bytes there.
+    bool more = true;
+    while (more) {
         DWORD avail = 0;
-        if (!WinHttpQueryDataAvailable(req.h, &avail)) return HRESULT_FROM_WIN32(GetLastError());
+        SetLastError(0);
+        if (!WinHttpQueryDataAvailable(req.h, &avail)) {
+            DWORD e = GetLastError();
+            if (!chunked_eof_quirk(e)) return http_failed(r, "WinHttpQueryDataAvailable");
+            if (g_cfg.debug) logf("WinHttpQueryDataAvailable refused with error %lu after a complete header block (HTTP %lu, %zu body bytes): end of body",
+                                  (unsigned long)e, (unsigned long)r.status, r.respBody.size());
+            break;
+        }
         if (!avail) break;
         if (r.respBody.size() + avail > kMaxBody) return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
-        size_t at = r.respBody.size();
-        r.respBody.resize(at + avail);
-        DWORD got = 0;
-        if (!WinHttpReadData(req.h, r.respBody.data() + at, avail, &got)) return HRESULT_FROM_WIN32(GetLastError());
-        r.respBody.resize(at + got);
-        if (!got) break;
+        // WinHttpReadData may hand back less than asked for: keep reading until it has nothing more.
+        DWORD want = avail;
+        while (want) {
+            size_t at = r.respBody.size();
+            r.respBody.resize(at + want);
+            DWORD got = 0;
+            SetLastError(0);
+            BOOL ok = WinHttpReadData(req.h, r.respBody.data() + at, want, &got);
+            r.respBody.resize(at + (ok ? got : 0));
+            if (!ok) {
+                DWORD e = GetLastError();
+                if (!chunked_eof_quirk(e)) return http_failed(r, "WinHttpReadData");
+                if (g_cfg.debug) logf("WinHttpReadData refused with error %lu after a complete header block (HTTP %lu, %zu body bytes): end of body",
+                                      (unsigned long)e, (unsigned long)r.status, r.respBody.size());
+                more = false;
+                break;
+            }
+            if (!got) { more = false; break; }
+            want -= got;
+        }
     }
     return S_OK;
 }
