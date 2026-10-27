@@ -32,6 +32,8 @@ constexpr AzimuthBuild kBuilds[] = {
                                       0x198630, 0x198640, 0x198650, 0x198660, 0x198690, 0x1986D0}},
     {0x6ADFF280, "1.0.1", 0x81E928, {0x66BFF0, 0x66BFE0, 0x66BFA0, 0x66BC10, 0x66BCD0, 0x66BDF0, 0x66BE60,
                                      0x66BE80, 0x66BE90, 0x66BEA0, 0x66BEB0, 0x66BEE0, 0x66BF20}},
+    {0x6AE05DD1, "1.0.2", 0x822A58, {0x670730, 0x670720, 0x6706E0, 0x670350, 0x670410, 0x670530, 0x6705A0,
+                                     0x6705C0, 0x6705D0, 0x6705E0, 0x6705F0, 0x670620, 0x670660}},
 };
 enum Slot { kQueryInterface, kAddRef, kRelease, kOpen, kSend, kAbort, kSetCookie, kSetCustomResponseStream,
             kSetProperty, kSetRequestHeader, kGetAllResponseHeaders, kGetCookie, kGetResponseHeader };
@@ -472,11 +474,17 @@ DWORD WINAPI worker(LPVOID param) {
             MemStream* ms = nullptr;
             if (r.custom) {
                 size_t off = 0;
+                HRESULT whr = S_OK;
+                ULONG wrote = 0;
                 while (off < r.respBody.size()) {
-                    ULONG wrote = 0;
-                    if (FAILED(r.custom->Write(r.respBody.data() + off, (ULONG)(r.respBody.size() - off), &wrote)) || !wrote) break;
+                    wrote = 0;
+                    whr = r.custom->Write(r.respBody.data() + off, (ULONG)(r.respBody.size() - off), &wrote);
+                    if (FAILED(whr) || !wrote) break;
                     off += wrote;
                 }
+                if (off < r.respBody.size())
+                    logf("response stream stopped taking data: wrote %zu of %zu bytes (Write hr=0x%08lx, last write %lu bytes)", off,
+                         r.respBody.size(), (unsigned long)whr, (unsigned long)wrote);
             } else {
                 ms = new MemStream();
                 ms->data = r.respBody;
@@ -663,7 +671,7 @@ bool xhr_bridge_install(const FH2ModApi* api, FH2Mod* mod, const BridgeConfig& c
     for (const AzimuthBuild& b : kBuilds)
         if (nt->FileHeader.TimeDateStamp == b.timestamp) build = &b;
     if (!build) {
-        logf("HTTP bridge: azimuth.exe build 0x%08lx isn't one this was written for (0.9.10, 1.0.1); not hooking",
+        logf("HTTP bridge: azimuth.exe build 0x%08lx isn't one this was written for (0.9.10, 1.0.1, 1.0.2); not hooking",
              (unsigned long)nt->FileHeader.TimeDateStamp);
         return false;
     }

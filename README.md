@@ -65,6 +65,11 @@ name); put `name=` under `[account]` in `account.ini` to change it. To start a n
 
 - New accounts can share a few items a day at first; after that there's a daily and a total cap per account.
 - Uploads are checked automatically. Broken files and offensive text are refused.
+- **Very large liveries can't be shared.** The game refuses to open a downloaded livery bigger than about 337 KB; it just says "Design Unavailable". The server therefore refuses uploads above that size instead of storing
+  something nobody can open. Simplify the design (delete some layers) and share it again. This is a limit inside the game, not
+  something the mod can change.
+- **Don't share designs made with a layer limit patch.** Tools that raise the game's layer limits let you build designs far
+  bigger than the game can load from the server, so nobody (including you) will be able to download them.
 - Tune previews are only a placeholder picture, AI opponents don't wear community liveries, and the game's **Clubs tab is
   switched off** (there are no club services).
 
@@ -95,6 +100,7 @@ Your game saves aren't touched. Designs you downloaded stay in your garage.
 |---|---|
 | Nothing connects, or "server not available" | Check your internet connection and that `communitygarage\server.ini` still has the server address (`host=`) and `scheme=https`. |
 | "The saved copy of this item is not on this server" when sharing | The game remembers it already uploaded this item somewhere else. Change it slightly, or save a copy, and share again. |
+| "Design Unavailable" / "Failed to download design" on one livery | That livery is probably over the game's download limit of about 337 KB (see Limits). Liveries uploaded before the server enforced the limit can still be on the server and can't be opened by anyone. Other liveries download normally. |
 | A share is refused | The server checks every upload for broken files and offensive text. The game only shows a generic error; the reason is in the server's log, so ask the server's operator. Check the title and keywords first. |
 | No `[CommunityGarage]` lines in `platform.log` | The mod didn't load. Check that `d3dcompiler_47.dll` is next to `azimuth.exe` and that `fh2-mods\CommunityGarage.dll` exists. |
 | Creator name shows with `#2` | Someone already uses your gamertag on the server; a number keeps names unique. |

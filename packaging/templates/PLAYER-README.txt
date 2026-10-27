@@ -38,6 +38,9 @@ is installed for you). Turn it off with check=0 under [updates] in communitygara
 LIMITS
 New accounts can share a few items a day at first. Uploads are checked automatically (broken files and offensive text are
 refused). The game's Clubs tab is switched off.
+Very large liveries (over about 337 KB) can't be shared: the game itself refuses to open them
+("Design Unavailable"). Delete some layers and share again.
+Don't share designs made with a layer limit patch: they end up far too big for the game to download.
 
 TROUBLESHOOTING
 - Look at fh2-mods\platform.log. Lines mentioning CommunityGarage say whether it loaded ("HTTP bridge installed") and
