@@ -51,6 +51,7 @@ volatile LONG g_share_tick = 0;     // tick count when the last share attempt st
 bool g_fake_token = true;       // experiment: Azimuth token requests complete successfully (see on_az_token_op)
 bool g_debug      = false;      // [debug] trace=1: diagnostic hooks and verbose logging (off for normal play)
 bool g_econ_scan  = false;      // experiment: scan memory for the economy object (see scan_economy)
+bool g_econ_probe = false;      // experiment: [experiments] economy_probe=1, also runs the scan
 bool g_token_text = false;      // experiment: non-empty Xbox token (see on_token_strings)
 int  g_skip_streams = -1;       // [azimuth] skip_livery_texture_streams: 1 on, 0 off, unset = only on Azimuth 0.9.10 (install_pack_skip)
 
@@ -107,17 +108,38 @@ bool load_config(const wchar_t* dir) {
     g_bridge.insecure_tls = GetPrivateProfileIntW(L"server", L"insecure_tls", 0, ini.c_str()) != 0;
     // Account: a random key made on first run identifies this install to the server; the display name is the
     // gamertag Azimuth already knows (data/azimuth.ini player_name) unless [account] name= says otherwise.
+    // They live in communitygarage/account.ini, a file no release ships, so an update that replaces server.ini can't
+    // wipe them. An account.ini without a key adopts the [account] key/name of an older server.ini.
     {
+        const std::wstring acc = std::wstring(dir) + L"/communitygarage/account.ini";
         wchar_t key[80] = {}, name[64] = {};
-        GetPrivateProfileStringW(L"account", L"key", L"", key, 80, ini.c_str());
+        GetPrivateProfileStringW(L"account", L"key", L"", key, 80, acc.c_str());
         if (wcslen(key) < 32) {
-            uint8_t raw[16] = {};
-            BCryptGenRandom(nullptr, raw, sizeof raw, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-            for (int i = 0; i < 16; i++) std::swprintf(key + i * 2, 3, L"%02x", raw[i]);
-            WritePrivateProfileStringW(L"account", L"key", key, ini.c_str());
-            logf("made a new account key (saved in communitygarage/server.ini; keep it private)");
+            wchar_t old_key[80] = {}, old_name[64] = {};
+            GetPrivateProfileStringW(L"account", L"key", L"", old_key, 80, ini.c_str());
+            GetPrivateProfileStringW(L"account", L"name", L"", old_name, 64, ini.c_str());
+            if (wcslen(old_key) >= 32) {
+                WritePrivateProfileStringW(L"account", L"key", old_key, acc.c_str());
+                if (old_name[0]) WritePrivateProfileStringW(L"account", L"name", old_name, acc.c_str());
+                GetPrivateProfileStringW(L"account", L"key", L"", key, 80, acc.c_str());
+                if (!wcscmp(key, old_key)) {      // only drop the old copy once the new file reads back the same
+                    WritePrivateProfileStringW(L"account", L"key", nullptr, ini.c_str());
+                    WritePrivateProfileStringW(L"account", L"name", nullptr, ini.c_str());
+                    logf("moved the account key and name from communitygarage/server.ini to communitygarage/account.ini");
+                } else {
+                    logf("couldn't write communitygarage/account.ini; leaving the key in server.ini");
+                    wcscpy_s(key, old_key);
+                }
+            } else {
+                uint8_t raw[16] = {};
+                BCryptGenRandom(nullptr, raw, sizeof raw, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                for (int i = 0; i < 16; i++) std::swprintf(key + i * 2, 3, L"%02x", raw[i]);
+                WritePrivateProfileStringW(L"account", L"key", key, acc.c_str());
+                logf("made a new account key (saved in communitygarage/account.ini; keep it private)");
+            }
         }
-        GetPrivateProfileStringW(L"account", L"name", L"", name, 64, ini.c_str());
+        GetPrivateProfileStringW(L"account", L"name", L"", name, 64, acc.c_str());
+        if (!name[0]) GetPrivateProfileStringW(L"account", L"name", L"", name, 64, ini.c_str());   // migration fallback
         if (!name[0]) {
             const std::wstring az = std::wstring(dir) + L"/data/azimuth.ini";
             GetPrivateProfileStringW(L"launcher", L"player_name", L"", name, 64, az.c_str());
@@ -131,7 +153,9 @@ bool load_config(const wchar_t* dir) {
     g_debug               = GetPrivateProfileIntW(L"debug", L"trace", 0, ini.c_str()) != 0;
     g_bridge.debug        = g_debug;
     g_econ_scan           = GetPrivateProfileIntW(L"experiments", L"economy_scan", 0, ini.c_str()) != 0;
-    g_bridge.fail_economy = GetPrivateProfileIntW(L"experiments", L"economy_probe", 0, ini.c_str()) != 0;
+    g_econ_probe          = GetPrivateProfileIntW(L"experiments", L"economy_probe", 0, ini.c_str()) != 0;
+    // Mods page "Use server economy values": off makes the mod fail GetEconomySettings, so the game keeps its own numbers.
+    g_bridge.fail_economy = g_econ_probe || GetPrivateProfileIntW(L"economy", L"use_server_values", 1, ini.c_str()) == 0;
     g_fake_token          = GetPrivateProfileIntW(L"experiments", L"fake_token", 1, ini.c_str()) != 0;
     g_token_text          = GetPrivateProfileIntW(L"experiments", L"token_text", 1, ini.c_str()) != 0;
     g_skip_streams        = static_cast<int>(GetPrivateProfileIntW(L"azimuth", L"skip_livery_texture_streams", static_cast<UINT>(-1), ini.c_str()));
@@ -1004,7 +1028,7 @@ DWORD WINAPI worker(LPVOID) {
         else if (ab)
             logf("Azimuth token request: the call isn't where expected; not hooked");
     }
-    if (g_bridge.fail_economy || g_econ_scan) CreateThread(nullptr, 0, econ_scan_thread, nullptr, 0, nullptr);
+    if (g_econ_probe || g_econ_scan) CreateThread(nullptr, 0, econ_scan_thread, nullptr, 0, nullptr);
 
     if (g_debug) {
         logf("debug tracing is on ([debug] trace=1): extra hooks and verbose logging");
@@ -1070,6 +1094,7 @@ static void on_setting_changed(void*, const char* key, int value) {
     const wchar_t* name = nullptr;
     if (!std::strcmp(key, "CheckUpdates")) { section = L"updates"; name = L"check"; }
     else if (!std::strcmp(key, "DebugLog")) { section = L"debug"; name = L"trace"; }
+    else if (!std::strcmp(key, "ServerEconomy")) { section = L"economy"; name = L"use_server_values"; }
     else return;
     WritePrivateProfileStringW(section, name, value ? L"1" : L"0", g_ini_path.c_str());
     logf("setting %s is now %s (applies the next time the game starts)", key, value ? "on" : "off");
@@ -1087,6 +1112,17 @@ static void add_mods_page_rows(const FH2ModApi* api) {
         s.needs_restart = 1;
         s.on_change     = on_setting_changed;
         api->add_setting(g_mod, &s);
+
+        FH2Setting e{};
+        e.size          = sizeof e;
+        e.key           = "ServerEconomy";
+        e.label         = "Use server economy values";
+        e.description   = "Take race payouts (credits and XP) from the Community Garage server. Turn it off to keep the game's own "
+                          "built-in values; the mod then doesn't ask the server for them.";
+        e.value         = GetPrivateProfileIntW(L"economy", L"use_server_values", 1, g_ini_path.c_str()) != 0;
+        e.needs_restart = 1;
+        e.on_change     = on_setting_changed;
+        api->add_setting(g_mod, &e);
 
         FH2Setting d{};
         d.size          = sizeof d;

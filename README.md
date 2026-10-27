@@ -56,9 +56,10 @@ To check that it loaded, open `fh2-mods\platform.log`: lines tagged `[CommunityG
 
 ### Your account
 
-The first start creates a random **account key** in `communitygarage\server.ini`. It's your login: **keep that file private
-and back it up** (if you lose it you become a new player and lose control of what you uploaded). Your creator name is the
-gamertag from `azimuth.ini` (a number is added if someone already has that name). To start a new account, delete the `key=` line.
+The first start creates a random **account key** in `communitygarage\account.ini` (older versions kept it in `server.ini`; it's moved over automatically). It's your login:
+**keep that file private and back it up** (if you lose it you become a new player and lose control of what you uploaded).
+Updates don't touch it. Your creator name is the gamertag from `azimuth.ini` (a number is added if someone already has that
+name); put `name=` under `[account]` in `account.ini` to change it. To start a new account, delete `account.ini`.
 
 ### Limits
 

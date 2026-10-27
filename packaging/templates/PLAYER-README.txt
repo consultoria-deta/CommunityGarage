@@ -25,7 +25,7 @@ USE IT
 - Everything you share is public to all players on the server.
 
 YOUR ACCOUNT
-The first time you start the game a random key is created in communitygarage\server.ini. It is your login: keep that
+The first time you start the game a random key is created in communitygarage\account.ini. It is your login: keep that
 file private, and back it up if you reinstall (without it you would become a new player and lose control of your uploads).
 The creator name shown is your gamertag from azimuth.ini (a number is added if someone has the same name).
 

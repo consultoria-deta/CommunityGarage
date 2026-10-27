@@ -455,7 +455,7 @@ DWORD WINAPI worker(LPVOID param) {
     bool probe = false;
     if (g_cfg.fail_economy) {
         for (auto& h : r.headers) if (iequals(h.first, L"X-Method") && iequals(h.second, L"GetEconomySettings")) probe = true;
-        if (probe) logf("economy_probe: failing GetEconomySettings on purpose, the game keeps its built-in economy values");
+        if (probe) logf("not asking the server for economy values (opted out or economy_probe), the game keeps its built-in economy values");
     }
     HRESULT hr = InterlockedCompareExchange(&r.aborted, 0, 0) ? HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED)
                                                                : (probe ? HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE) : (r.synthetic ? do_synthetic(r, job->body) : do_http(r, job->body)));
