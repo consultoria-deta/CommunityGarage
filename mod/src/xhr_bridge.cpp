@@ -219,7 +219,10 @@ HRESULT do_http(Req& r, const std::vector<uint8_t>& body) {
             if (std::isalnum(c) || c == '-' || c == '_' || c == '.') { enc += (char)c; }
             else { std::snprintf(tmp, sizeof tmp, "%%%02X", c); enc += tmp; }
         }
-        hdrs += L"X-CT-Key: " + wide(g_cfg.key) + L"\r\n" + L"X-CT-Name: " + wide(enc) + L"\r\n";
+        hdrs += L"X-CT-Key: " + wide(g_cfg.key) + L"\r\n";
+        // An empty value with ADD|REPLACE means "delete this header" and fails with ERROR_WINHTTP_HEADER_NOT_FOUND
+        // (0x80072f76), so a player with no gamertag configured must not send the header at all.
+        if (!enc.empty()) hdrs += L"X-CT-Name: " + wide(enc) + L"\r\n";
     }
 
     bool local = iequals(hostName, L"localhost") || hostName == L"127.0.0.1" || hostName == L"::1";
