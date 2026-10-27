@@ -580,12 +580,32 @@ void WINAPI raise_detour(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR* 
 // ---- Azimuth's three "offline" error producers (all return ERROR_NETWORK_UNREACHABLE, 0x800704CF):
 // OfflinePicture (azimuth+0x41D20), OfflineTokenRequest (+0xD3E20) and a larger one at +0x16AF10.
 // Log when each is called, with a stack scan, to see which one the share operation runs into.
-struct AzSite { const char* name; uint32_t rva; uint64_t (*orig)(uint64_t, uint64_t, uint64_t, uint64_t); };
+struct AzSite { const char* name; uint64_t (*orig)(uint64_t, uint64_t, uint64_t, uint64_t); };
 AzSite g_az[] = {
-    {"Azimuth.OfflinePicture", 0x41D20, nullptr},
-    {"Azimuth.OfflineTokenRequest", 0xD3E20, nullptr},
-    {"Azimuth offline op @0x16AF10", 0x16AF10, nullptr},
+    {"Azimuth.OfflinePicture", nullptr},
+    {"Azimuth.OfflineTokenRequest", nullptr},
+    {"Azimuth offline op", nullptr},
 };
+
+// Addresses inside azimuth.exe, per build (PE timestamp). token_call is the call that constructs the failed
+// OfflineTokenRequest op (mov r8d,0x800704CF just before it). Patching these on any other build would corrupt
+// unrelated code, so an unknown build gets no Azimuth hooks.
+struct AzBuild { DWORD timestamp; uint32_t site[3]; uint32_t token_call; };
+const AzBuild kAzBuilds[] = {
+    {0x6AD14833, {0x41D20, 0xD3E20, 0x16AF10}, 0xD3EAD},      // 0.9.10
+    {0x6ADFF280, {0x421D0, 0x2A6A50, 0x5DA0F0}, 0x2A6ADD},    // Oct 2026 update
+};
+const AzBuild* az_build() {
+    static const AzBuild* found = [] () -> const AzBuild* {
+        auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+        auto* nt   = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+        for (const AzBuild& b : kAzBuilds)
+            if (b.timestamp == nt->FileHeader.TimeDateStamp) return &b;
+        logf("azimuth.exe build 0x%08lx is unknown: Azimuth token/diagnostic hooks skipped", (unsigned long)nt->FileHeader.TimeDateStamp);
+        return nullptr;
+    }();
+    return found;
+}
 template <int K>
 uint64_t az_detour(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     static LONG n = 0;
@@ -619,8 +639,10 @@ uint64_t az_detour(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     return g_az[K].orig(a, b, c, d);
 }
 template <int K> void install_az() {
+    const AzBuild* b = az_build();
+    if (!b) return;
     uintptr_t azb = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    g_api->hook_function(g_mod, g_az[K].name, reinterpret_cast<void*>(azb + g_az[K].rva), reinterpret_cast<void*>(&az_detour<K>),
+    g_api->hook_function(g_mod, g_az[K].name, reinterpret_cast<void*>(azb + b->site[K]), reinterpret_cast<void*>(&az_detour<K>),
                          reinterpret_cast<void**>(&g_az[K].orig));
 }
 
@@ -929,10 +951,12 @@ DWORD WINAPI worker(LPVOID) {
     g_api->hook_function(g_mod, "logon response broadcast", reinterpret_cast<void*>(base + (0x14126C5E0 - kImageBase)),
                          reinterpret_cast<void*>(&broadcast_detour), reinterpret_cast<void**>(&g_broadcast_orig));
     if (g_api->api_version >= 7 && g_fake_token) {
-        init_fake_token();
-        g_api->hook_instruction(g_mod, "Azimuth token request -> success",
-                                reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + 0xD3EAD),
-                                on_az_token_op, nullptr);
+        if (const AzBuild* ab = az_build()) {
+            init_fake_token();
+            g_api->hook_instruction(g_mod, "Azimuth token request -> success",
+                                    reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + ab->token_call),
+                                    on_az_token_op, nullptr);
+        }
     }
     if (g_bridge.fail_economy || g_econ_scan) CreateThread(nullptr, 0, econ_scan_thread, nullptr, 0, nullptr);
 
