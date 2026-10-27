@@ -52,6 +52,7 @@ bool g_fake_token = true;       // experiment: Azimuth token requests complete s
 bool g_debug      = false;      // [debug] trace=1: diagnostic hooks and verbose logging (off for normal play)
 bool g_econ_scan  = false;      // experiment: scan memory for the economy object (see scan_economy)
 bool g_token_text = false;      // experiment: non-empty Xbox token (see on_token_strings)
+int  g_skip_streams = -1;       // [azimuth] skip_livery_texture_streams: 1 on, 0 off, unset = only on Azimuth 0.9.10 (install_pack_skip)
 
 void logf(const char* fmt, ...) {
     char line[256];
@@ -133,7 +134,46 @@ bool load_config(const wchar_t* dir) {
     g_bridge.fail_economy = GetPrivateProfileIntW(L"experiments", L"economy_probe", 0, ini.c_str()) != 0;
     g_fake_token          = GetPrivateProfileIntW(L"experiments", L"fake_token", 1, ini.c_str()) != 0;
     g_token_text          = GetPrivateProfileIntW(L"experiments", L"token_text", 1, ini.c_str()) != 0;
+    g_skip_streams        = static_cast<int>(GetPrivateProfileIntW(L"azimuth", L"skip_livery_texture_streams", static_cast<UINT>(-1), ini.c_str()));
     return true;
+}
+
+// ---- Azimuth 0.9.10 stops ("CreatePlacementTexture2D requires GPU-write/CPU-map/unknown placement semantics") when
+// CLiveryRenderManager::SaveRenderToStream (game+0x122E2C0) packs the texture streams of a fully composed livery: its
+// packer game+0x122E450 asks for a 1024x1024 CPU-readable placement texture that Azimuth doesn't implement. The job runs
+// after every full layer composition (modes 2 and 4 always, mode 5 once all layer groups are composed), and once the
+// game is logged on, the drivatar livery loader composes the liveries it gets from the server, so a session dies a few
+// minutes after logon. The packer is the only step that needs that texture and it already has an early-out for a
+// resource without a stream ([res+0x328] == 0): skipping it leaves the rest untouched, the job still posts event
+// 0x10013 and CCarLivery moves on at once. Manual Share packs through slot 21 (game+0x122DF20) and is not affected.
+// server.ini [azimuth] skip_livery_texture_streams=0 turns this off (e.g. on an Azimuth build that supports it).
+bool safe_read(const void* p, void* out, size_t n);
+void (*g_pack_orig)(void*) = nullptr;
+void pack_skip(void* res) {
+    static LONG n = 0;
+    if (InterlockedIncrement(&n) <= 5)
+        logf("livery texture streams: pack skipped for resource %p (Azimuth has no CPU-readable placement textures) (#%ld)", res, n);
+}
+// azimuth.exe 0.9.10 (PE timestamp 0x6AD14833, the build xhr_bridge.cpp is written for) is the one known to lack
+// CPU-readable placement textures. Unless server.ini says otherwise, the pack is skipped only on that build.
+bool azimuth_is_0910() {
+    auto* b = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(b + reinterpret_cast<const IMAGE_DOS_HEADER*>(b)->e_lfanew);
+    return nt->FileHeader.TimeDateStamp == 0x6AD14833u;
+}
+void install_pack_skip(uintptr_t base) {
+    bool on = g_skip_streams < 0 ? azimuth_is_0910() : g_skip_streams != 0;
+    if (!on) { logf("livery texture streams: left as the game does it (%s)", g_skip_streams < 0 ? "not the Azimuth 0.9.10 build" : "[azimuth] skip_livery_texture_streams=0"); return; }
+    static const uint8_t expect[] = {0x40, 0x55, 0x56, 0x57, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x70};   // push rbp; push rsi; push rdi; mov rbp,rsp; sub rsp,0x70
+    uint8_t got[sizeof expect] = {};
+    void* at = reinterpret_cast<void*>(base + (0x14122E450 - kImageBase));
+    if (!safe_read(at, got, sizeof got) || std::memcmp(got, expect, sizeof expect) != 0) {
+        logf("livery texture streams: game+0x122E450 doesn't look as expected; not hooking (the game keeps packing them)");
+        return;
+    }
+    FH2Hook* h = g_api->hook_function(g_mod, "CLiveryRenderManager::SaveRenderToStream pack (skipped: Azimuth 0.9.10)", at,
+                                      reinterpret_cast<void*>(&pack_skip), reinterpret_cast<void**>(&g_pack_orig));
+    if (!h) logf("livery texture streams: hook failed; the game keeps packing them");
 }
 
 // ---- Diagnostics: log-only hooks, to learn why the Storefront says "server not available".
@@ -934,6 +974,7 @@ DWORD WINAPI worker(LPVOID) {
         FH2Hook* h = g_api->patch_bytes(g_mod, "Clubs tab off", reinterpret_cast<void*>(base + (0x1406F0899 - kImageBase)), &was, &now, 1);
         if (!h || !g_api->enable_hooks(g_mod, h)) logf("Clubs tab: the game code didn't look as expected, leaving it alone");
     }
+    install_pack_skip(base);
     // What changes the game's behaviour: the date default, the Xbox token callback and strings, the login-listener skip, the poll
     // intervals, and Azimuth's token request. Everything else (below, under g_debug) only logs.
     if (g_api->api_version >= 7) {
@@ -951,12 +992,17 @@ DWORD WINAPI worker(LPVOID) {
     g_api->hook_function(g_mod, "logon response broadcast", reinterpret_cast<void*>(base + (0x14126C5E0 - kImageBase)),
                          reinterpret_cast<void*>(&broadcast_detour), reinterpret_cast<void**>(&g_broadcast_orig));
     if (g_api->api_version >= 7 && g_fake_token) {
-        if (const AzBuild* ab = az_build()) {
-            init_fake_token();
-            g_api->hook_instruction(g_mod, "Azimuth token request -> success",
-                                    reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + ab->token_call),
-                                    on_az_token_op, nullptr);
-        }
+        init_fake_token();
+        // The call to the operation constructor, right after "mov r8d, 0x800704CF" (14 bytes before it).
+        auto* az = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+        const AzBuild* ab = az_build();
+        static const uint8_t mov_r8d[] = {0x41, 0xB8, 0xCF, 0x04, 0x07, 0x80};
+        uint8_t got[sizeof mov_r8d] = {}, call = 0;
+        if (ab && safe_read(az + ab->token_call - 14, got, sizeof got) && safe_read(az + ab->token_call, &call, 1) &&
+            std::memcmp(got, mov_r8d, sizeof got) == 0 && call == 0xE8)
+            g_api->hook_instruction(g_mod, "Azimuth token request -> success", az + ab->token_call, on_az_token_op, nullptr);
+        else if (ab)
+            logf("Azimuth token request: the call isn't where expected; not hooked");
     }
     if (g_bridge.fail_economy || g_econ_scan) CreateThread(nullptr, 0, econ_scan_thread, nullptr, 0, nullptr);
 
