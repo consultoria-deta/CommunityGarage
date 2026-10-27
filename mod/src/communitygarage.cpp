@@ -971,9 +971,20 @@ DWORD WINAPI worker(LPVOID) {
                          reinterpret_cast<void*>(&broadcast_detour), reinterpret_cast<void**>(&g_broadcast_orig));
     if (g_api->api_version >= 7 && g_fake_token) {
         init_fake_token();
-        g_api->hook_instruction(g_mod, "Azimuth token request -> success",
-                                reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + 0xD3EAD),
-                                on_az_token_op, nullptr);
+        // The call to the operation constructor, right after "mov r8d, 0x800704CF" (14 bytes before it).
+        auto* az = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+        auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(az + reinterpret_cast<const IMAGE_DOS_HEADER*>(az)->e_lfanew);
+        uint32_t site = nt->FileHeader.TimeDateStamp == 0x6AD14833u ? 0xD3EAD      // 0.9.10
+                      : nt->FileHeader.TimeDateStamp == 0x6ADFF280u ? 0x2A6ADD     // 1.0.1
+                      : 0;
+        static const uint8_t mov_r8d[] = {0x41, 0xB8, 0xCF, 0x04, 0x07, 0x80};
+        uint8_t got[sizeof mov_r8d] = {}, call = 0;
+        if (site && safe_read(az + site - 14, got, sizeof got) && safe_read(az + site, &call, 1) &&
+            std::memcmp(got, mov_r8d, sizeof got) == 0 && call == 0xE8)
+            g_api->hook_instruction(g_mod, "Azimuth token request -> success", az + site, on_az_token_op, nullptr);
+        else
+            logf("Azimuth token request: azimuth.exe build 0x%08lx isn't a known one or the call isn't there; not hooked",
+                 (unsigned long)nt->FileHeader.TimeDateStamp);
     }
     if (g_bridge.fail_economy || g_econ_scan) CreateThread(nullptr, 0, econ_scan_thread, nullptr, 0, nullptr);
 

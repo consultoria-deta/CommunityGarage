@@ -24,12 +24,15 @@ BridgeConfig     g_cfg;
 
 constexpr size_t kMaxBody = 64u * 1024 * 1024;
 
-// azimuth.exe 0.9.10 (PE timestamp 0x6AD14833): the OfflineRequest vtable and the
-// RVA each of its 13 slots points at (IUnknown, then IXMLHTTPRequest2 in order).
-constexpr DWORD    kAzimuthTimestamp = 0x6AD14833;
-constexpr uint32_t kVtableRva        = 0x2CCC60;
-constexpr uint32_t kSlotRva[13] = {0x1982D0, 0x198340, 0x198350, 0x1983B0, 0x198470, 0x1985A0, 0x198610,
-                                   0x198630, 0x198640, 0x198650, 0x198660, 0x198690, 0x1986D0};
+// The OfflineRequest vtable and the RVA each of its 13 slots points at (IUnknown, then IXMLHTTPRequest2 in
+// order), per azimuth.exe build (PE timestamp). Found through the class's RTTI (.?AVOfflineRequest@...).
+struct AzimuthBuild { DWORD timestamp; const char* name; uint32_t vtable; uint32_t slot[13]; };
+constexpr AzimuthBuild kBuilds[] = {
+    {0x6AD14833, "0.9.10", 0x2CCC60, {0x1982D0, 0x198340, 0x198350, 0x1983B0, 0x198470, 0x1985A0, 0x198610,
+                                      0x198630, 0x198640, 0x198650, 0x198660, 0x198690, 0x1986D0}},
+    {0x6ADFF280, "1.0.1", 0x81E928, {0x66BFF0, 0x66BFE0, 0x66BFA0, 0x66BC10, 0x66BCD0, 0x66BDF0, 0x66BE60,
+                                     0x66BE80, 0x66BE90, 0x66BEA0, 0x66BEB0, 0x66BEE0, 0x66BF20}},
+};
 enum Slot { kQueryInterface, kAddRef, kRelease, kOpen, kSend, kAbort, kSetCookie, kSetCustomResponseStream,
             kSetProperty, kSetRequestHeader, kGetAllResponseHeaders, kGetCookie, kGetResponseHeader };
 
@@ -656,15 +659,18 @@ bool xhr_bridge_install(const FH2ModApi* api, FH2Mod* mod, const BridgeConfig& c
     auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
     auto* nt   = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->FileHeader.TimeDateStamp != kAzimuthTimestamp) {
-        logf("HTTP bridge: azimuth.exe build 0x%08lx isn't the one this was written for (0x%08lx); not hooking",
-             (unsigned long)nt->FileHeader.TimeDateStamp, (unsigned long)kAzimuthTimestamp);
+    const AzimuthBuild* build = nullptr;
+    for (const AzimuthBuild& b : kBuilds)
+        if (nt->FileHeader.TimeDateStamp == b.timestamp) build = &b;
+    if (!build) {
+        logf("HTTP bridge: azimuth.exe build 0x%08lx isn't one this was written for (0.9.10, 1.0.1); not hooking",
+             (unsigned long)nt->FileHeader.TimeDateStamp);
         return false;
     }
-    auto** vt = reinterpret_cast<void**>(base + kVtableRva);
+    auto** vt = reinterpret_cast<void**>(base + build->vtable);
     for (int i = 0; i < 13; i++) {
-        if (reinterpret_cast<uint8_t*>(vt[i]) != base + kSlotRva[i]) {
-            logf("HTTP bridge: OfflineRequest vtable slot %d isn't where expected; not hooking", i);
+        if (reinterpret_cast<uint8_t*>(vt[i]) != base + build->slot[i]) {
+            logf("HTTP bridge: OfflineRequest vtable slot %d isn't where expected (Azimuth %s); not hooking", i, build->name);
             return false;
         }
     }
