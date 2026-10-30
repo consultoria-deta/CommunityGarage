@@ -54,6 +54,7 @@ bool g_econ_scan  = false;      // experiment: scan memory for the economy objec
 bool g_econ_probe = false;      // experiment: [experiments] economy_probe=1, also runs the scan
 bool g_token_text = false;      // experiment: non-empty Xbox token (see on_token_strings)
 int  g_skip_streams = -1;       // [azimuth] skip_livery_texture_streams: 1 on, 0 off, unset = on (install_pack_skip)
+int  g_skip_packer  = -1;       // [azimuth] skip_texture_stream_packer: 1 on, 0 off, unset = same as skip_livery_texture_streams (install_packer_guard)
 
 void logf(const char* fmt, ...) {
     char line[256];
@@ -159,6 +160,7 @@ bool load_config(const wchar_t* dir) {
     g_fake_token          = GetPrivateProfileIntW(L"experiments", L"fake_token", 1, ini.c_str()) != 0;
     g_token_text          = GetPrivateProfileIntW(L"experiments", L"token_text", 1, ini.c_str()) != 0;
     g_skip_streams        = static_cast<int>(GetPrivateProfileIntW(L"azimuth", L"skip_livery_texture_streams", static_cast<UINT>(-1), ini.c_str()));
+    g_skip_packer         = static_cast<int>(GetPrivateProfileIntW(L"azimuth", L"skip_texture_stream_packer", static_cast<UINT>(-1), ini.c_str()));
     return true;
 }
 
@@ -204,6 +206,62 @@ void install_pack_skip(uintptr_t base) {
     logf("livery texture streams: pack hook installed at game+0x122E450 (azimuth.exe 0x%08lx, %s): Azimuth has no CPU-readable "
          "placement textures", (unsigned long)azimuth_timestamp(),
          g_skip_streams < 0 ? "default on every Azimuth build" : "[azimuth] skip_livery_texture_streams=1");
+}
+
+// ---- Safety net under the pack above: game+0x10EB6E0 is the generic texture -> "BCXT" stream packer that both the
+// automatic path (game+0x122E450 via the thunk at game+0x10EB6D0) and Share in mode 2 (game+0x10EB510, call at
+// game+0x10EB58C) end in. It builds a placement desc with CPUAccessFlags = D3D11_CPU_ACCESS_READ (0x20000, immediate at
+// game+0x10EBA85) on every path: the function has one ret and no branch skips the CreatePlacementTexture2D call at
+// game+0x10EBAE7, so every call stops the game on Azimuth. It is void (nothing sets rax for the callers), writes only
+// into the stream its second argument points at, and the two known callers ignore its result: game+0x122E450 releases
+// its locks and returns (nobody reads the stream after event 0x10013), game+0x10EB510 mode 2 returns false anyway
+// (game+0x10EB5CB). An unknown caller gets an untouched (empty) stream instead of a certain stop; the first call from
+// each caller is logged with its return address so such paths can be identified.
+// [azimuth] skip_texture_stream_packer=0 turns this off on its own; by default it follows skip_livery_texture_streams.
+uintptr_t g_packer_base = 0;
+void (*g_packer_orig)(void*, void*, void*) = nullptr;
+volatile LONG64 g_packer_callers[16] = {};
+void packer_skip(void* tex, void* stream, void*) {
+    static volatile LONG total = 0;
+    LONG n = InterlockedIncrement(&total);
+    const LONG64 ret = static_cast<LONG64>(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    for (volatile LONG64& slot : g_packer_callers) {
+        LONG64 had = InterlockedCompareExchange64(&slot, ret, 0);
+        if (had == ret) return;                     // caller already logged
+        if (had == 0) {                             // first call from this caller
+            const uintptr_t r = static_cast<uintptr_t>(ret);
+            if (r >= g_packer_base && r < g_packer_base + 0x3A18000)
+                logf("texture stream packer skipped: new caller game+0x%llX (texture %p, stream %p, call #%ld)",
+                     (unsigned long long)(r - g_packer_base), tex, stream, n);
+            else
+                logf("texture stream packer skipped: new caller %p outside the game (texture %p, stream %p, call #%ld)",
+                     reinterpret_cast<void*>(r), tex, stream, n);
+            return;
+        }
+    }
+    if (n <= 64) logf("texture stream packer skipped (call #%ld; caller list full)", n);
+}
+void install_packer_guard(uintptr_t base) {
+    const bool on = g_skip_packer < 0 ? skip_streams_on() : g_skip_packer != 0;
+    if (!on) {
+        logf("texture stream packer: left as the game does it (%s)",
+             g_skip_packer < 0 ? "[azimuth] skip_livery_texture_streams=0" : "[azimuth] skip_texture_stream_packer=0");
+        return;
+    }
+    // mov [rsp+0x18],r8; mov [rsp+0x10],rdx; push rbp; push rbx; push rsi; push rdi; push r12
+    static const uint8_t expect[] = {0x4c, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54};
+    uint8_t got[sizeof expect] = {};
+    void* at = reinterpret_cast<void*>(base + (0x1410EB6E0 - kImageBase));
+    if (!safe_read(at, got, sizeof got) || std::memcmp(got, expect, sizeof expect) != 0) {
+        logf("texture stream packer: game+0x10EB6E0 doesn't look as expected; not hooking (any call to it still stops Azimuth)");
+        return;
+    }
+    g_packer_base = base;
+    FH2Hook* h = g_api->hook_function(g_mod, "texture stream packer (skipped: Azimuth has no CPU-readable placement textures)", at,
+                                      reinterpret_cast<void*>(&packer_skip), reinterpret_cast<void**>(&g_packer_orig));
+    if (!h) { logf("texture stream packer: hook failed; any call to it still stops Azimuth"); return; }
+    logf("texture stream packer: guard installed at game+0x10EB6E0 (%s): it always asks Azimuth for a CPU-readable texture; "
+         "callers are logged once each", g_skip_packer < 0 ? "default, follows skip_livery_texture_streams" : "[azimuth] skip_texture_stream_packer=1");
 }
 
 // ---- Diagnostics: log-only hooks, to learn why the Storefront says "server not available".
@@ -1006,6 +1064,7 @@ DWORD WINAPI worker(LPVOID) {
         if (!h || !g_api->enable_hooks(g_mod, h)) logf("Clubs tab: the game code didn't look as expected, leaving it alone");
     }
     install_pack_skip(base);
+    install_packer_guard(base);
     // What changes the game's behaviour: the date default, the Xbox token callback and strings, the login-listener skip, the poll
     // intervals, and Azimuth's token request. Everything else (below, under g_debug) only logs.
     if (g_api->api_version >= 7) {
